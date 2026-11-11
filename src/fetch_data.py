@@ -44,7 +44,7 @@ def load_api_key() -> str:
     load_dotenv(PROJECT_ROOT / ".env")
     key = os.getenv("CENSUS_API_KEY")
     if not key:
-        sys.exit("CENSUS_API_KEY not found in .env")
+        sys.exit("CENSUS_API_KEY is not set. Put it in .env or set it as an environment variable.")
     return key
 
 
@@ -64,7 +64,10 @@ def fetch_hs6(hs6: str, api_key: str) -> pd.DataFrame:
         sys.exit(f"Network error fetching HS {hs6}: {type(exc).__name__}")
 
     if resp.status_code == 204:  # Census returns 204 when no rows match
-        return pd.DataFrame()
+        # Both headings have had imports from Japan every month, so no rows means a
+        # problem with the API, not a real zero. Saving only the other heading would
+        # silently cut the totals, so stop instead.
+        sys.exit(f"Census API returned no rows for HS {hs6}; the existing file was not changed.")
     if resp.status_code != 200:
         sys.exit(f"API error for HS {hs6}: HTTP {resp.status_code}: {resp.text[:300]}")
 
@@ -92,11 +95,30 @@ def tidy(raw: pd.DataFrame) -> pd.DataFrame:
     return df.sort_values(["month", "hs10_code"]).reset_index(drop=True)
 
 
+def check_no_lost_months(new_months: pd.Series) -> None:
+    """Stop before saving if the new data is empty or is missing months the saved file has.
+
+    Past months never disappear from the source, so a missing month means the download
+    was incomplete. Stopping keeps the good file in place (and in the scheduled GitHub
+    job, makes the run fail so nothing is committed).
+    """
+    if new_months.empty:
+        sys.exit("No rows downloaded; the existing file was not changed.")
+    try:
+        old = set(pd.read_csv(OUTPUT_PATH, usecols=["month"], dtype=str)["month"])
+    except (FileNotFoundError, ValueError):  # first run, or a file without a month column
+        return
+    lost = sorted(old - set(new_months.dt.strftime("%Y-%m")))
+    if lost:
+        sys.exit(f"New data is missing {len(lost)} month(s) the saved file has "
+                 f"({lost[0]} to {lost[-1]}); the existing file was not changed.")
+
+
 def main() -> None:
     api_key = load_api_key()
     frames = [fetch_hs6(hs6, api_key) for hs6 in GREEN_TEA_HS6]
-    raw = pd.concat([f for f in frames if not f.empty], ignore_index=True)
-    df = tidy(raw)
+    df = tidy(pd.concat(frames, ignore_index=True))
+    check_no_lost_months(df["month"])
 
     OUTPUT_PATH.parent.mkdir(parents=True, exist_ok=True)
     df.to_csv(OUTPUT_PATH, index=False, date_format="%Y-%m")

@@ -1,0 +1,107 @@
+# Downloads fresh data from all three sources once a day and commits the data files,
+# but only when the numbers actually changed.
+#
+# Secrets (Settings > Secrets and variables > Actions):
+#   CENSUS_API_KEY  for src/fetch_data.py (US Census)
+#   ESTAT_APP_ID    for src/fetch_japan_data.py (Japan e-Stat)
+# The exchange rate script (src/fetch_fx_data.py) uses FRED's public CSV and needs no key.
+
+name: Refresh data
+
+on:
+  schedule:
+    # 15:17 UTC every day: after the Census release (8:30 a.m. US Eastern) and Japan's
+    # trade release (8:50 a.m. Japan time). Off the hour, because GitHub delays
+    # scheduled runs most at the top of the hour.
+    - cron: "17 15 * * *"
+  workflow_dispatch: # adds a "Run workflow" button on the Actions page
+
+# Nothing by default; the job below asks only for what it needs.
+permissions: {}
+
+# Never run two refreshes at once (e.g. a manual run during the scheduled one).
+concurrency:
+  group: refresh-data
+  cancel-in-progress: false
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: write # to push the data commit; nothing else
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # Don't leave the push token on disk while packages install and scripts run.
+          # It is handed to git only in the final step.
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.13"
+
+      - name: Install requirements
+        run: python -m pip install -r requirements.txt
+
+      # Each script stops with an error, before saving, if its download fails, is empty,
+      # or is missing months already saved. Any failed step stops the job here, so the
+      # commit step never runs and nothing is committed: all three update, or none do.
+      - name: Fetch US Census imports
+        env:
+          CENSUS_API_KEY: ${{ secrets.CENSUS_API_KEY }}
+        run: python src/fetch_data.py
+
+      - name: Fetch Japan e-Stat exports
+        env:
+          ESTAT_APP_ID: ${{ secrets.ESTAT_APP_ID }}
+        run: python src/fetch_japan_data.py
+
+      - name: Fetch exchange rates (FRED, no key needed)
+        run: python src/fetch_fx_data.py
+
+      - name: Commit and push data if it changed
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          BRANCH: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+
+          # Each dataset is a CSV plus a text file with its pull time. The pull time is
+          # new on every run, so only the CSVs decide whether anything changed. A pull
+          # time is committed together with its own CSV, so on the dashboard it means
+          # "when this data last changed".
+          changed=()
+          while read -r csv stamp; do
+            if [ -n "$(git status --porcelain -- "data/$csv")" ]; then
+              git add -- "data/$csv" "data/$stamp"
+              changed+=("$csv")
+            fi
+          done <<'LIST'
+          tea_imports.csv last_pulled.txt
+          matcha_exports.csv matcha_last_pulled.txt
+          fx_rates.csv fx_last_pulled.txt
+          LIST
+
+          if [ ${#changed[@]} -eq 0 ]; then
+            echo "No data changed. Nothing to commit."
+            exit 0
+          fi
+
+          # Throw away the new pull times of datasets that did not change.
+          git checkout -- data/
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -m "Refresh data: ${changed[*]}"
+          git show --stat --format="%s" HEAD
+
+          # Same login method actions/checkout uses, but only for these two commands.
+          auth=$(printf 'x-access-token:%s' "$GITHUB_TOKEN" | base64 -w0)
+          echo "::add-mask::$auth"
+          header="AUTHORIZATION: basic $auth"
+          # If someone pushed while this ran, put the data commit on top of their work.
+          git -c http.https://github.com/.extraheader="$header" pull --rebase origin "$BRANCH"
+          git -c http.https://github.com/.extraheader="$header" push origin "HEAD:$BRANCH"

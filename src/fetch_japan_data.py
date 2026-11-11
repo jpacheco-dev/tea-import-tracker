@@ -67,7 +67,7 @@ def load_app_id() -> str:
     load_dotenv(PROJECT_ROOT / ".env")
     app_id = os.getenv("ESTAT_APP_ID")
     if not app_id:
-        sys.exit("ESTAT_APP_ID not found in .env")
+        sys.exit("ESTAT_APP_ID is not set. Put it in .env or set it as an environment variable.")
     return app_id
 
 
@@ -265,6 +265,25 @@ def calendar_stage(year: int, month: int, now: datetime, monthly: dict, yearly: 
     return "確報"
 
 
+def check_no_lost_months(new_months: pd.Series) -> None:
+    """Stop before saving if the new data is empty or is missing months the saved file has.
+
+    Past months never disappear from the source, so a missing month means the download
+    was incomplete. Stopping keeps the good file in place (and in the scheduled GitHub
+    job, makes the run fail so nothing is committed).
+    """
+    if new_months.empty:
+        sys.exit("No rows downloaded; the existing file was not changed.")
+    try:
+        old = set(pd.read_csv(OUTPUT_PATH, usecols=["month"], dtype=str)["month"])
+    except (FileNotFoundError, ValueError):  # first run, or a file without a month column
+        return
+    lost = sorted(old - set(new_months.dt.strftime("%Y-%m")))
+    if lost:
+        sys.exit(f"New data is missing {len(lost)} month(s) the saved file has "
+                 f"({lost[0]} to {lost[-1]}); the existing file was not changed.")
+
+
 # ---------- Main ----------
 
 def main() -> None:
@@ -312,6 +331,7 @@ def main() -> None:
     num_cols = [c for c in df.columns if c.endswith("_kg") or c.endswith("_yen")]
     df[num_cols] = df[num_cols].round().astype("int64")
     df = df.sort_values("month").reset_index(drop=True)
+    check_no_lost_months(df["month"])
 
     OUTPUT_PATH.parent.mkdir(parents=True, exist_ok=True)
     df.to_csv(OUTPUT_PATH, index=False, date_format="%Y-%m")

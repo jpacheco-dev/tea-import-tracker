@@ -3,7 +3,8 @@
 Two separate datasets, each on its own tab:
 - US imports of green tea from Japan: data/tea_imports.csv (src/fetch_data.py, US Census)
 - Japan's exports of powdered green tea (matcha) to the US: data/matcha_exports.csv
-  (src/fetch_japan_data.py, Japan's trade statistics via e-Stat)
+  (src/fetch_japan_data.py, Japan's trade statistics via e-Stat), in yen, with optional
+  USD estimates from data/fx_rates.csv (src/fetch_fx_data.py, Federal Reserve via FRED)
 
 The app reads only these CSV files. It never calls an API and needs no keys.
 
@@ -22,6 +23,8 @@ DATA_PATH = DATA_DIR / "tea_imports.csv"
 PULLED_AT_PATH = DATA_DIR / "last_pulled.txt"
 MATCHA_PATH = DATA_DIR / "matcha_exports.csv"
 MATCHA_PULLED_AT_PATH = DATA_DIR / "matcha_last_pulled.txt"
+FX_PATH = DATA_DIR / "fx_rates.csv"
+FX_PULLED_AT_PATH = DATA_DIR / "fx_last_pulled.txt"
 
 # Short labels built from the three things that distinguish the HS10 codes:
 # packing size (<= 3 kg "Packaged" vs larger "Bulk"), flavoring, and organic status.
@@ -67,7 +70,10 @@ def last_pulled(pulled_path: Path, data_path: Path) -> str:
         pulled = datetime.fromisoformat(pulled_path.read_text().strip())
         return pulled.strftime("%B %-d, %Y")
     except (OSError, ValueError):
-        mtime = datetime.fromtimestamp(data_path.stat().st_mtime)
+        try:
+            mtime = datetime.fromtimestamp(data_path.stat().st_mtime)
+        except OSError:
+            return "not downloaded yet"
         return f"{mtime:%B %-d, %Y} (estimated from file date)"
 
 
@@ -328,6 +334,41 @@ def load_matcha() -> pd.DataFrame:
     return df.sort_values("month").set_index("month")
 
 
+@st.cache_data
+def load_fx() -> pd.Series | None:
+    """Monthly average yen per US dollar (Fed series EXJPUS), indexed by month. None if no file."""
+    try:
+        fx = pd.read_csv(FX_PATH)
+    except FileNotFoundError:
+        return None
+    fx["month"] = pd.to_datetime(fx["month"], format="%Y-%m")
+    return fx.set_index("month")["jpy_per_usd"]
+
+
+def with_usd(jp: pd.DataFrame, fx: pd.Series | None) -> pd.DataFrame:
+    """Copy of the matcha data with USD columns added, in memory only.
+
+    Each month's yen is divided by that same month's average rate. A month with no
+    published rate gets a blank (NaN) USD value, never a borrowed or guessed rate.
+    The yen columns are left as they are, and nothing is written back to the CSV.
+    """
+    out = jp.copy()
+    out["jpy_per_usd"] = fx.reindex(out.index) if fx is not None else float("nan")
+    for pack in PACKS:
+        out[f"{pack}_value_usd"] = out[f"{pack}_value_yen"] / out["jpy_per_usd"]
+        # Same as USD value / kg, since both months' figures use the same rate.
+        out[f"{pack}_price_per_kg_usd"] = out[f"{pack}_price_per_kg"] / out["jpy_per_usd"]
+    return out
+
+
+def month_list(months: pd.DatetimeIndex) -> str:
+    """Short text for a set of months, e.g. "Oct 2026" or "Sep 2026 and Oct 2026"."""
+    names = [f"{m:%b %Y}" for m in months]
+    if len(names) <= 3:
+        return " and ".join([", ".join(names[:-1]), names[-1]]) if len(names) > 1 else names[0]
+    return f"{len(names)} months ({names[0]} to {names[-1]})"
+
+
 def stage_runs(stages: pd.Series) -> list[tuple[str, pd.Timestamp, pd.Timestamp]]:
     """Consecutive months that share a non-final stage, as (stage, first month, last month)."""
     runs: list[list] = []
@@ -372,10 +413,21 @@ def stage_caption(stages: pd.Series) -> str:
 
 
 def matcha_section() -> None:
-    jp = load_matcha()
+    fx = load_fx()
+    jp = with_usd(load_matcha(), fx)
     all_months = pd.date_range(jp.index.min(), jp.index.max(), freq="MS")
 
     st.header("Japan's powdered green tea (matcha) exports to the US")
+
+    currency = st.radio(
+        "Currency", options=["JPY", "USD"], horizontal=True, key="matcha_currency",
+        format_func=lambda c: {"JPY": "JPY (yen, as reported)", "USD": "USD (estimate)"}[c],
+        help="Switches value and price per kg. Volume in kg is the same in both.",
+    )
+    usd = currency == "USD"
+    if usd and fx is None:
+        st.warning("No exchange rate file found (data/fx_rates.csv), so USD values cannot be shown. "
+                   "Run `src/fetch_fx_data.py` to create it.")
 
     f1, f2 = st.columns([2, 3], gap="large")
     with f1:
@@ -386,32 +438,61 @@ def matcha_section() -> None:
             horizontal=True, key="matcha_pack",
         )
     label, color = PACKS[pack]
-    kg_col, yen_col, price_col = f"{pack}_kg", f"{pack}_value_yen", f"{pack}_price_per_kg"
+    kg_col = f"{pack}_kg"
+    # Value and price columns for the chosen currency. Volume is the same in both.
+    val_col = f"{pack}_value_usd" if usd else f"{pack}_value_yen"
+    price_col = f"{pack}_price_per_kg_usd" if usd else f"{pack}_price_per_kg"
+    sym = "$" if usd else "¥"
 
     rng = jp.loc[start:end]
     stages = rng["stage"]
 
-    st.caption(f"Monthly exports, {start:%b %Y} to {end:%b %Y}. Source: Japan's Ministry of Finance "
-               "trade statistics, via e-Stat. **All values are in Japanese yen (JPY)**, not converted.")
+    if usd:
+        st.caption(f"Monthly exports, {start:%b %Y} to {end:%b %Y}. Source: Japan's Ministry of Finance "
+                   "trade statistics, via e-Stat, reported in yen. **USD values are estimates**: each "
+                   "month's yen is converted at that month's average exchange rate (Federal Reserve). "
+                   "See About this data.")
+        no_rate = rng.index[rng["jpy_per_usd"].isna()]
+        if fx is not None and len(no_rate):
+            st.warning(f"No exchange rate has been published yet for {month_list(no_rate)}, so USD is "
+                       "left blank for that month rather than guessed. It appears as a gap in the value "
+                       "and price charts, and the headline numbers below show n/a if their 12 months "
+                       "include it. Its volume (kg) and yen values are shown as usual.")
+    else:
+        st.caption(f"Monthly exports, {start:%b %Y} to {end:%b %Y}. Source: Japan's Ministry of Finance "
+                   "trade statistics, via e-Stat. **Values are in Japanese yen (JPY)** as reported.")
 
     # ---------------------------------------------------------------- headline numbers
     latest_start, prior_start, prior_end, has_prior = kpi_windows(end, all_months[0])
 
     def window(a, b):
         w = jp.loc[a:b]
-        value, kg = w[yen_col].sum(), w[kg_col].sum()
-        return value, kg, (value / kg if kg else float("nan")), int((w["stage"] != "Final").sum())
+        kg = w[kg_col].sum()
+        # A sum would silently skip months with no rate, so a 12-month USD total would cover
+        # fewer months than it says. Instead the USD total is n/a if any month lacks a rate.
+        missing = w.index[w["jpy_per_usd"].isna()] if usd else w.index[:0]
+        value = float("nan") if len(missing) else w[val_col].sum()
+        price = value / kg if kg and not pd.isna(value) else float("nan")
+        return value, kg, price, int((w["stage"] != "Final").sum()), missing
 
-    lv, lk, lp, l_open = window(latest_start, end)
-    pv, pk, pp, p_open = window(prior_start, prior_end) if has_prior else (None, None, None, 0)
+    lv, lk, lp, l_open, l_missing = window(latest_start, end)
+    pv, pk, pp, p_open, p_missing = (window(prior_start, prior_end) if has_prior
+                                     else (None, None, None, 0, jp.index[:0]))
 
+    def money(x: float) -> str:
+        return "n/a" if pd.isna(x) else (fmt_usd(x) if usd else fmt_yen(x))
+
+    def per_kg(x: float) -> str:
+        return "n/a" if pd.isna(x) else (f"${x:,.2f}" if usd else f"¥{x:,.0f}")
+
+    est = ", estimate" if usd else ""
     st.subheader(f"{kpi_heading(latest_start, end, all_months[0])}: {label}")
     c1, c2, c3 = st.columns(3)
-    c1.metric("Total export value (JPY)", fmt_yen(lv), pct_change(lv, pv) if has_prior else None,
+    c1.metric(f"Total export value ({currency}{est})", money(lv), pct_change(lv, pv) if has_prior else None,
               delta_color="off", border=True)
     c2.metric("Total volume", fmt_kg(lk), pct_change(lk, pk) if has_prior else None,
               delta_color="off", border=True)
-    c3.metric("Average price per kg (JPY)", f"¥{lp:,.0f}" if not pd.isna(lp) else "n/a",
+    c3.metric(f"Average price per kg ({currency}{est})", per_kg(lp),
               pct_change(lp, pp) if has_prior else None, delta_color="off", border=True)
     notes = []
     if not has_prior:
@@ -419,6 +500,11 @@ def matcha_section() -> None:
     if l_open or p_open:
         notes.append(f"Includes months that are not final yet: {l_open} of the latest 12"
                      + (f" and {p_open} of the prior 12" if has_prior else "") + ".")
+    if len(l_missing):
+        notes.append(f"USD value and price are n/a because there is no published exchange rate yet for "
+                     f"{month_list(l_missing)}. Move the end of the date range earlier to see USD totals.")
+    elif len(p_missing):
+        notes.append(f"No USD comparison: no published exchange rate for {month_list(p_missing)}.")
     if notes:
         st.caption(" ".join(notes))
 
@@ -432,13 +518,20 @@ def matcha_section() -> None:
             color=color, customdata=stage_list), stages), width="stretch", key="jp_volume")
     with right:
         st.markdown(f"**Monthly export value**: {label}")
+        if usd:
+            value_args = ("Million US dollars (USD, estimate)", ",.0f", "$%{y:,.2f}M · %{customdata}")
+        else:
+            value_args = ("Million yen (JPY)", ",.0f", "¥%{y:,.1f}M · %{customdata}")
         st.plotly_chart(mark_stages(line_chart(
-            rng[yen_col] / 1e6, "Value", "Million yen (JPY)", ",.0f", "¥%{y:,.1f}M · %{customdata}",
+            rng[val_col] / 1e6, "Value", *value_args,
             color=color, customdata=stage_list), stages), width="stretch", key="jp_value")
 
-    st.markdown(f"**Average price per kg**: {label} (total yen divided by total kg)")
+    price_axis = "US dollars per kg (USD, estimate)" if usd else "Yen per kg (JPY)"
+    price_fmt = "$,.0f" if usd else ",.0f"
+    price_hover = "$%{y:,.2f}" if usd else "¥%{y:,.0f}"
+    st.markdown(f"**Average price per kg**: {label} (total {'USD' if usd else 'yen'} divided by total kg)")
     st.plotly_chart(mark_stages(line_chart(
-        rng[price_col], "Price per kg", "Yen per kg (JPY)", ",.0f", "¥%{y:,.0f} per kg · %{customdata}",
+        rng[price_col], "Price per kg", price_axis, price_fmt, price_hover + " per kg · %{customdata}",
         color=color, customdata=stage_list), stages, chart_px=1250), width="stretch", key="jp_price")
     st.caption(stage_caption(stages))
 
@@ -460,16 +553,17 @@ def matcha_section() -> None:
                           legend=dict(orientation="h", yanchor="top", y=-0.1, x=0, traceorder="normal"))
         st.plotly_chart(mark_stages(fig, stages), width="stretch", key="jp_volume_by_pack")
     with right:
-        st.markdown("**Average price per kg by pack type** (JPY)")
+        st.markdown(f"**Average price per kg by pack type** ({currency}{est})")
         fig = go.Figure()
         mode = "lines+markers" if len(rng) < 3 else "lines"
+        suffix = "_usd" if usd else ""
         for p, (p_label, p_color) in PACKS.items():
             fig.add_trace(go.Scatter(
-                x=rng.index, y=rng[f"{p}_price_per_kg"], name=p_label, mode=mode, customdata=stage_list,
+                x=rng.index, y=rng[f"{p}_price_per_kg{suffix}"], name=p_label, mode=mode, customdata=stage_list,
                 line=dict(color=p_color, width=2), marker=dict(size=8),
-                hovertemplate=f"{p_label}: ¥%{{y:,.0f}} per kg · %{{customdata}}<extra></extra>",
+                hovertemplate=f"{p_label}: {price_hover} per kg · %{{customdata}}<extra></extra>",
             ))
-        base_layout(fig, "Yen per kg (JPY)", ",.0f")
+        base_layout(fig, price_axis, price_fmt)
         fig.update_layout(height=360, showlegend=True,
                           legend=dict(orientation="h", yanchor="top", y=-0.1, x=0))
         st.plotly_chart(mark_stages(fig, stages), width="stretch", key="jp_price_by_pack")
@@ -480,12 +574,22 @@ def matcha_section() -> None:
         table["month"] = table["month"].dt.strftime("%Y-%m")
         cols = ["month", "stage"]
         config = {"month": "Month", "stage": "Revision stage"}
+        if usd:
+            # Show the rate used for each month, so every USD figure can be checked by hand.
+            cols.append("jpy_per_usd")
+            config["jpy_per_usd"] = st.column_config.NumberColumn("Yen per USD (monthly average)", format="%.4f")
         for p, (p_label, _) in PACKS.items():
             short = p_label.split(" (")[0]
             cols += [f"{p}_kg", f"{p}_value_yen", f"{p}_price_per_kg"]
             config[f"{p}_kg"] = st.column_config.NumberColumn(f"{short}: volume (kg)", format="%d")
             config[f"{p}_value_yen"] = st.column_config.NumberColumn(f"{short}: value (JPY)", format="¥%d")
             config[f"{p}_price_per_kg"] = st.column_config.NumberColumn(f"{short}: price per kg (JPY)", format="¥%.0f")
+            if usd:
+                cols += [f"{p}_value_usd", f"{p}_price_per_kg_usd"]
+                config[f"{p}_value_usd"] = st.column_config.NumberColumn(
+                    f"{short}: value (USD, estimate)", format="$%d")
+                config[f"{p}_price_per_kg_usd"] = st.column_config.NumberColumn(
+                    f"{short}: price per kg (USD, estimate)", format="$%.2f")
         cols.append("estat_table_id")
         config["estat_table_id"] = "e-Stat table ID"
         st.dataframe(table[cols].sort_values("month", ascending=False), hide_index=True,
@@ -506,6 +610,15 @@ def matcha_section() -> None:
         f"`{tid}` ({g.index.min():%b %Y} to {g.index.max():%b %Y})"
         for tid, g in jp.groupby("estat_table_id", sort=False)
     )
+    if fx is None:
+        fx_note = "The exchange rate file has not been downloaded yet, so no USD figures are available."
+    else:
+        no_rate = jp.index[jp["jpy_per_usd"].isna()]
+        fx_note = (f"Exchange rates available: {fx.index.min():%B %Y} to {fx.index.max():%B %Y}, "
+                   f"last pulled **{last_pulled(FX_PULLED_AT_PATH, FX_PATH)}**. A month's rate is used only "
+                   "once the month is over, never a partial-month figure. ")
+        fx_note += (f"No rate has been published yet for {month_list(no_rate)}, so its USD values are "
+                    "left blank." if len(no_rate) else "Every month in the matcha data has a published rate.")
     st.markdown(
         f"""
 **What this measures.** Exports of **powdered green tea** from Japan to the United States.
@@ -526,10 +639,17 @@ match exactly: they are recorded by different countries at different points in t
 shipment (leaving Japan vs arriving in the US), valued differently, in different
 currencies, and the US codes cover all green tea, not only powdered.
 
-**Currency.** Values are in **Japanese yen** as reported. e-Stat publishes them in thousands
-of yen, which we multiply by 1,000. There is no currency conversion, so yen values should
-not be compared directly with the dollar values in the US tab. Price per kg is the month's
-total value divided by its total kg.
+**Currency.** Values are reported in **Japanese yen**. e-Stat publishes them in thousands
+of yen, which we multiply by 1,000. Price per kg is the month's total value divided by its
+total kg. The yen figures in the data file are never changed; USD is calculated on the page.
+
+**USD estimates.** The exchange rate is the Federal Reserve Board's **Japanese Yen to U.S.
+Dollar Spot Exchange Rate** (G.5 release, series `EXJPUS`, via FRED), in yen per dollar.
+Each month's yen value is divided by that same month's average rate, which the Fed
+calculates from the daily noon buying rates in New York. These USD figures are
+**estimates**: the actual shipments were priced and paid on different days, at different
+rates. Even in USD, these figures will not match the US imports tab, for the reasons above.
+{fx_note}
 
 **Revision stages.** Japan publishes each month's figures and then revises them in steps.
 Months that are not final are shaded in the charts.
@@ -554,8 +674,16 @@ Data last pulled: **{last_pulled(MATCHA_PULLED_AT_PATH, MATCHA_PATH)}**. Covers
 st.set_page_config(page_title="Green Tea Trade: Japan and the US", layout="wide")
 st.title("Green Tea Trade: Japan and the US")
 st.caption("Two separate datasets from two different countries. Each tab has its own filters and notes.")
+# Each date is when that dataset last changed: the daily refresh job saves a new pull
+# time only together with new numbers.
+st.markdown(
+    "**Data last updated:** "
+    f"US imports {last_pulled(PULLED_AT_PATH, DATA_PATH)} · "
+    f"Japan matcha exports {last_pulled(MATCHA_PULLED_AT_PATH, MATCHA_PATH)} · "
+    f"Exchange rates {last_pulled(FX_PULLED_AT_PATH, FX_PATH)}"
+)
 
-us_tab, matcha_tab = st.tabs(["US imports of green tea (USD)", "Japan's matcha exports (JPY)"])
+us_tab, matcha_tab = st.tabs(["US imports of green tea (USD)", "Japan's matcha exports (JPY / USD)"])
 with us_tab:
     us_section()
 with matcha_tab:
