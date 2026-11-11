@@ -403,6 +403,57 @@ def mark_stages(fig: go.Figure, stages: pd.Series, chart_px: int = 600) -> go.Fi
     return fig
 
 
+def mark_extremes(fig: go.Figure, prices: pd.Series, fmt, color: str) -> go.Figure:
+    """Label the highest and lowest monthly average price in the range shown.
+
+    These are monthly averages (total value / total kg). Japan publishes only monthly
+    totals, so the highest or lowest single shipment price is not available.
+    Months with no price (e.g. no exchange rate yet, in USD) are skipped.
+    """
+    s = prices.dropna()
+    if len(s) < 2 or s.max() == s.min():
+        return fig
+    span = (s.index[-1] - s.index[0]) or pd.Timedelta(days=1)
+    for name, month in (("Highest", s.idxmax()), ("Lowest", s.idxmin())):
+        value = s[month]
+        fig.add_trace(go.Scatter(
+            x=[month], y=[value], mode="markers", hoverinfo="skip", showlegend=False,
+            marker=dict(size=10, color=color, line=dict(color=SURFACE, width=2)), cliponaxis=False,
+        ))
+        # Put the label beside the point, on the side with more room, so it never runs off the chart.
+        right_half = (month - s.index[0]) / span > 0.5
+        fig.add_annotation(
+            x=month, y=value, text=f"{name} month: {fmt(value)} ({month:%b %Y})",
+            showarrow=False, xanchor="right" if right_half else "left", xshift=-10 if right_half else 10,
+            font=dict(size=12, color=MUTED_INK), bgcolor=SURFACE,
+        )
+    # Marker traces make Plotly pad the axis past the data; keep it to the months shown.
+    if len(prices) > 1:
+        fig.update_xaxes(range=[prices.index[0], prices.index[-1]])
+    return fig
+
+
+def price_range_by_year(prices: pd.Series, stages: pd.Series) -> pd.DataFrame:
+    """One row per year: the lowest and highest monthly average price, and the spread between them."""
+    s = prices.dropna()
+    rows = []
+    for year, g in s.groupby(s.index.year):
+        final = (stages.reindex(g.index) == "Final").all()
+        rows.append({
+            "year": str(year),
+            "months": len(g),
+            "low_month": f"{g.idxmin():%b}",
+            "low": g.min(),
+            "high_month": f"{g.idxmax():%b}",
+            "high": g.max(),
+            "spread": g.max() / g.min(),
+            "status": "Final" if final else "Not final yet",
+        })
+    # Fixed columns, so an empty range (e.g. USD with no exchange rates) still gives a valid table.
+    return pd.DataFrame(rows, columns=["year", "months", "low_month", "low", "high_month", "high",
+                                       "spread", "status"])
+
+
 def stage_caption(stages: pd.Series) -> str:
     runs = stage_runs(stages)
     if not runs:
@@ -530,10 +581,36 @@ def matcha_section() -> None:
     price_fmt = "$,.0f" if usd else ",.0f"
     price_hover = "$%{y:,.2f}" if usd else "¥%{y:,.0f}"
     st.markdown(f"**Average price per kg**: {label} (total {'USD' if usd else 'yen'} divided by total kg)")
-    st.plotly_chart(mark_stages(line_chart(
+    price_fig = mark_stages(line_chart(
         rng[price_col], "Price per kg", price_axis, price_fmt, price_hover + " per kg · %{customdata}",
-        color=color, customdata=stage_list), stages, chart_px=1250), width="stretch", key="jp_price")
-    st.caption(stage_caption(stages))
+        color=color, customdata=stage_list), stages, chart_px=1250)
+    st.plotly_chart(mark_extremes(price_fig, rng[price_col], per_kg, color), width="stretch", key="jp_price")
+    st.caption(stage_caption(stages) + " Highest and lowest are monthly averages, not single shipment "
+               "prices: Japan publishes only each month's total value and total kg.")
+
+    st.markdown(f"**Price range by year**: {label}, lowest and highest monthly average price per kg "
+                f"({currency}{est})")
+    ranges = price_range_by_year(rng[price_col], stages)
+    # Round, don't truncate, so the table matches the chart labels (e.g. ¥3,756.96 shows as ¥3757).
+    ranges[["low", "high"]] = ranges[["low", "high"]].round(2 if usd else 0)
+    money_fmt = "$%.2f" if usd else "¥%d"
+    st.dataframe(
+        ranges.sort_values("year", ascending=False), hide_index=True, width="stretch",
+        column_config={
+            "year": "Year",
+            "months": st.column_config.NumberColumn("Months in range", format="%d"),
+            "low_month": "Lowest month",
+            "low": st.column_config.NumberColumn("Lowest price per kg", format=money_fmt),
+            "high_month": "Highest month",
+            "high": st.column_config.NumberColumn("Highest price per kg", format=money_fmt),
+            "spread": st.column_config.NumberColumn(
+                "Highest ÷ lowest", format="%.2f",
+                help="How many times the highest month's price was the lowest month's. 1.50 means 50% higher."),
+            "status": "Revision status",
+        },
+    )
+    st.caption("Uses the date range and pack type selected above. Years cut short by the date range, "
+               "or not yet complete, have fewer than 12 months.")
 
     # ---------------------------------------------------------------- small vs bulk
     st.subheader("Small packs vs bulk packs")
