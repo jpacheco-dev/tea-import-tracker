@@ -12,6 +12,7 @@ Notes on the query (verified against the endpoint's variables.json):
 
 import os
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pandas as pd
@@ -21,6 +22,8 @@ from dotenv import load_dotenv
 API_URL = "https://api.census.gov/data/timeseries/intltrade/imports/hs"
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 OUTPUT_PATH = PROJECT_ROOT / "data" / "tea_imports.csv"
+# One line: the UTC time of the last successful pull, ISO 8601. Read by app.py.
+PULLED_AT_PATH = PROJECT_ROOT / "data" / "last_pulled.txt"
 
 JAPAN_CTY_CODE = "5880"
 GREEN_TEA_HS6 = ["090210", "090220"]
@@ -97,7 +100,11 @@ def main() -> None:
 
     OUTPUT_PATH.parent.mkdir(parents=True, exist_ok=True)
     df.to_csv(OUTPUT_PATH, index=False, date_format="%Y-%m")
+    # Written only after the CSV saves, so it never claims a pull that failed.
+    pulled_at = datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+    PULLED_AT_PATH.write_text(pulled_at + "\n")
     print(f"Saved {len(df)} rows to {OUTPUT_PATH.relative_to(PROJECT_ROOT)}")
+    print(f"Pull time {pulled_at} saved to {PULLED_AT_PATH.relative_to(PROJECT_ROOT)}")
     print(f"Months covered: {df['month'].min():%Y-%m} to {df['month'].max():%Y-%m}")
 
 
